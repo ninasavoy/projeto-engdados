@@ -117,12 +117,9 @@ def insert_silver(df: pd.DataFrame) -> int:
 
     with get_psycopg2_conn() as conn:
         with conn.cursor() as cur:
-            import psycopg2.extras
-            psycopg2.extras.execute_batch(
-                cur,
+            cur.executemany(
                 sql,
                 [[r.get(c) for c in cols] for r in records],
-                page_size=500,
             )
     return len(records)
 

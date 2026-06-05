@@ -6,8 +6,7 @@ Helpers de conexão com PostgreSQL via psycopg2 e SQLAlchemy.
 import os
 from contextlib import contextmanager
 
-import psycopg2
-import psycopg2.extras
+import psycopg
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 
@@ -19,7 +18,7 @@ log = get_logger("db")
 
 def get_connection_string() -> str:
     return (
-        f"postgresql+psycopg2://"
+        f"postgresql+psycopg://"
         f"{os.getenv('POSTGRES_USER', 'prf')}:"
         f"{os.getenv('POSTGRES_PASSWORD', 'prf123')}@"
         f"{os.getenv('POSTGRES_HOST', 'localhost')}:"
@@ -37,8 +36,8 @@ def get_engine():
 
 @contextmanager
 def get_psycopg2_conn():
-    """Context manager para conexão direta com psycopg2."""
-    conn = psycopg2.connect(
+    """Context manager para conexão direta com psycopg3."""
+    conn = psycopg.connect(
         host=os.getenv("POSTGRES_HOST", "localhost"),
         port=int(os.getenv("POSTGRES_PORT", 5432)),
         dbname=os.getenv("POSTGRES_DB", "prf_dw"),
