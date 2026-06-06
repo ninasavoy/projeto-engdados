@@ -17,7 +17,9 @@ from pipeline.metrics import (
     records_loaded_gold,
     stage_duration_seconds,
     last_run_timestamp,
+    push_metrics,
 )
+from pipeline.tracing import init_tracing, shutdown_tracing
 
 log = get_logger("load")
 
@@ -53,7 +55,7 @@ def upsert_dim_tempo(engine, dates: pd.Series) -> dict:
                 (data_completa, ano, trimestre, mes, nome_mes,
                  semana_ano, dia_mes, dia_semana_num, dia_semana_nome, fim_de_semana)
             SELECT
-                d.data_completa, d.ano, d.trimestre, d.mes, d.nome_mes,
+                d.data_completa::date, d.ano, d.trimestre, d.mes, d.nome_mes,
                 d.semana_ano, d.dia_mes, d.dia_semana_num, d.dia_semana_nome, d.fim_de_semana
             FROM (VALUES {}) AS d(data_completa, ano, trimestre, mes, nome_mes,
                                     semana_ano, dia_mes, dia_semana_num, dia_semana_nome, fim_de_semana)
@@ -69,7 +71,8 @@ def upsert_dim_tempo(engine, dates: pd.Series) -> dict:
         conn.commit()
 
         result = conn.execute(text(
-            "SELECT data_completa, sk_tempo FROM gold.dim_tempo WHERE data_completa = ANY(:dates)",
+            "SELECT data_completa, sk_tempo FROM gold.dim_tempo "
+            "WHERE data_completa::text = ANY(:dates)",
         ), {"dates": [str(d) for d in unique_dates]})
         return {str(row[0]): row[1] for row in result}
 
@@ -103,10 +106,24 @@ def upsert_dim_lookup(engine, table: str, conflict_col: str, values: list[str]) 
         return {row[0]: row[1] for row in result}
 
 
+def _normalize_loc_key(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normaliza a chave natural de localização para o merge casar dos dois lados.
+
+    km volta do banco como Decimal (NUMERIC) e no DataFrame é float — sem
+    normalizar, o merge do pandas não casa (493 de 600 ficavam sem sk).
+    """
+    out = frame.copy()
+    out["km"] = pd.to_numeric(out["km"], errors="coerce").round(3)
+    for c in ["uf", "municipio", "br"]:
+        out[c] = out[c].astype("string")
+    return out
+
+
 def upsert_dim_localizacao(engine, df: pd.DataFrame) -> pd.Series:
     """Upsert em dim_localizacao. Retorna Series com sk_localizacao por index."""
     loc_cols = ["uf", "municipio", "br", "km", "regional", "delegacia", "uop", "latitude", "longitude"]
-    loc_df = df[loc_cols].drop_duplicates(subset=["uf", "municipio", "br", "km"]).dropna(subset=["uf"])
+    work = _normalize_loc_key(df[loc_cols])
+    loc_df = work.drop_duplicates(subset=["uf", "municipio", "br", "km"]).dropna(subset=["uf"])
 
     with engine.connect() as conn:
         for _, row in loc_df.iterrows():
@@ -122,9 +139,12 @@ def upsert_dim_localizacao(engine, df: pd.DataFrame) -> pd.Series:
         result = conn.execute(text(
             "SELECT sk_localizacao, uf, municipio, br, km FROM gold.dim_localizacao"
         ))
-        loc_map = pd.DataFrame(result.fetchall(), columns=["sk_localizacao", "uf", "municipio", "br", "km"])
+        loc_map = _normalize_loc_key(
+            pd.DataFrame(result.fetchall(),
+                         columns=["sk_localizacao", "uf", "municipio", "br", "km"])
+        )
 
-    merged = df[["uf", "municipio", "br", "km"]].merge(
+    merged = work[["uf", "municipio", "br", "km"]].merge(
         loc_map, on=["uf", "municipio", "br", "km"], how="left"
     )
     return merged["sk_localizacao"]
@@ -160,68 +180,78 @@ def upsert_dim_condicao(engine, df: pd.DataFrame) -> pd.Series:
 
 def run_load(batch_size: int = 5000) -> None:
     """Lê silver.acidentes e popula o Star Schema no Gold."""
-    engine = get_engine()
+    # init_tracing ANTES de get_engine para o SQLAlchemy ser instrumentado.
+    tracer = init_tracing("prf-load")
     t0 = time.time()
     log.info("load_started")
 
-    # Lê Silver
-    df = pd.read_sql("SELECT * FROM silver.acidentes ORDER BY id", engine)
-    log.info("silver_read", rows=len(df))
+    try:
+        with tracer.start_as_current_span("load") as span:
+            engine = get_engine()
 
-    if df.empty:
-        log.warning("silver_empty_nothing_to_load")
-        return
+            # Lê Silver
+            df = pd.read_sql("SELECT * FROM silver.acidentes ORDER BY id", engine)
+            log.info("silver_read", rows=len(df))
 
-    # Upsert dimensões
-    log.info("upserting_dimensions")
+            if df.empty:
+                log.warning("silver_empty_nothing_to_load")
+                return
 
-    tempo_map = upsert_dim_tempo(engine, df["data_inversa"])
-    causa_map = upsert_dim_lookup(engine, "dim_causa", "causa_acidente",
-                                  df["causa_acidente"].tolist())
-    tipo_map = upsert_dim_lookup(engine, "dim_tipo_acidente", "tipo_acidente",
-                                 df["tipo_acidente"].tolist())
+            # Upsert dimensões
+            log.info("upserting_dimensions")
 
-    df["sk_tempo"] = df["data_inversa"].astype(str).map(tempo_map)
-    df["sk_causa"] = df["causa_acidente"].map(causa_map)
-    df["sk_tipo"] = df["tipo_acidente"].map(tipo_map)
-    df["sk_localizacao"] = upsert_dim_localizacao(engine, df)
-    df["sk_condicao"] = upsert_dim_condicao(engine, df)
+            tempo_map = upsert_dim_tempo(engine, df["data_inversa"])
+            causa_map = upsert_dim_lookup(engine, "dim_causa", "causa_acidente",
+                                          df["causa_acidente"].tolist())
+            tipo_map = upsert_dim_lookup(engine, "dim_tipo_acidente", "tipo_acidente",
+                                         df["tipo_acidente"].tolist())
 
-    log.info("dimensions_upserted")
+            df["sk_tempo"] = df["data_inversa"].astype(str).map(tempo_map)
+            df["sk_causa"] = df["causa_acidente"].map(causa_map)
+            df["sk_tipo"] = df["tipo_acidente"].map(tipo_map)
+            df["sk_localizacao"] = upsert_dim_localizacao(engine, df)
+            df["sk_condicao"] = upsert_dim_condicao(engine, df)
 
-    # Insere fato em batches
-    fato_cols = [
-        "sk_tempo", "sk_localizacao", "sk_causa", "sk_tipo", "sk_condicao",
-        "pessoas", "mortos", "feridos_graves", "feridos_leves", "ilesos", "veiculos",
-        "horario", "id",
-    ]
-    fato_df = df[fato_cols].rename(columns={"id": "source_id"})
-    fato_df = fato_df.dropna(subset=["sk_tempo", "sk_localizacao"])
+            log.info("dimensions_upserted")
 
-    total_loaded = 0
-    for i in range(0, len(fato_df), batch_size):
-        batch = fato_df.iloc[i:i + batch_size]
-        batch.to_sql(
-            "fato_acidente",
-            engine,
-            schema="gold",
-            if_exists="append",
-            index=False,
-            method="multi",
-        )
-        total_loaded += len(batch)
-        log.info("fato_batch_loaded", batch=i // batch_size + 1, rows=len(batch))
+            # Insere fato em batches
+            fato_cols = [
+                "sk_tempo", "sk_localizacao", "sk_causa", "sk_tipo", "sk_condicao",
+                "pessoas", "mortos", "feridos_graves", "feridos_leves", "ilesos", "veiculos",
+                "horario", "id",
+            ]
+            fato_df = df[fato_cols].rename(columns={"id": "source_id"})
+            fato_df = fato_df.dropna(subset=["sk_tempo", "sk_localizacao"])
 
-    records_loaded_gold.inc(total_loaded)
+            total_loaded = 0
+            for i in range(0, len(fato_df), batch_size):
+                batch = fato_df.iloc[i:i + batch_size]
+                batch.to_sql(
+                    "fato_acidente",
+                    engine,
+                    schema="gold",
+                    if_exists="append",
+                    index=False,
+                    method="multi",
+                )
+                total_loaded += len(batch)
+                log.info("fato_batch_loaded", batch=i // batch_size + 1, rows=len(batch))
 
-    # Atualiza views materializadas
-    refresh_materialized_views(engine)
+            records_loaded_gold.inc(total_loaded)
+            span.set_attribute("prf.rows_loaded", total_loaded)
 
-    elapsed = time.time() - t0
-    stage_duration_seconds.labels(stage="load").observe(elapsed)
-    last_run_timestamp.labels(stage="load").set_to_current_time()
+            # Atualiza views materializadas
+            refresh_materialized_views(engine)
 
-    log.info("load_finished", total_loaded=total_loaded, elapsed_seconds=round(elapsed, 2))
+            elapsed = time.time() - t0
+            stage_duration_seconds.labels(stage="load").observe(elapsed)
+            last_run_timestamp.labels(stage="load").set_to_current_time()
+            push_metrics("load")
+
+            log.info("load_finished", total_loaded=total_loaded,
+                     elapsed_seconds=round(elapsed, 2))
+    finally:
+        shutdown_tracing()
 
 
 if __name__ == "__main__":

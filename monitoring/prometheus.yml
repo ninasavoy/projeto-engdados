@@ -3,10 +3,12 @@ global:
   evaluation_interval: 15s
 
 scrape_configs:
-  - job_name: "prf_pipeline"
+  # Pushgateway — métricas dos jobs batch do pipeline (ingest/transform/load).
+  # honor_labels preserva os labels enviados pelo pipeline (ex.: stage, source_year).
+  - job_name: "prf_pipeline_pushgateway"
+    honor_labels: true
     static_configs:
-      - targets: ["host.docker.internal:8000"]
-    metrics_path: /metrics
+      - targets: ["pushgateway:9091"]
 
   - job_name: "prometheus"
     static_configs:

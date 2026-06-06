@@ -6,10 +6,12 @@ Importar e chamar start_metrics_server() uma vez por processo.
 
 import os
 from prometheus_client import (
+    REGISTRY,
     Counter,
     Gauge,
     Histogram,
     start_http_server,
+    pushadd_to_gateway,
 )
 
 from pipeline.logger import get_logger
@@ -64,3 +66,25 @@ def start_metrics_server() -> None:
     port = int(os.getenv("PROMETHEUS_PORT", 8000))
     start_http_server(port)
     log.info("metrics_server_started", port=port)
+
+
+def push_metrics(stage: str, job: str = "prf_pipeline") -> None:
+    """
+    Empurra as métricas atuais para o Prometheus Pushgateway.
+
+    Etapas do pipeline são jobs batch de vida curta — um servidor HTTP efêmero
+    raramente é raspado a tempo pelo Prometheus. O Pushgateway resolve isso:
+    cada etapa empurra suas métricas ao terminar, agrupadas por `stage`.
+
+    No-op se PUSHGATEWAY_URL não estiver definido (ex.: execução de teste local).
+    """
+    url = os.getenv("PUSHGATEWAY_URL")
+    if not url:
+        log.info("pushgateway_disabled", stage=stage)
+        return
+    try:
+        pushadd_to_gateway(url, job=job, registry=REGISTRY,
+                           grouping_key={"stage": stage})
+        log.info("metrics_pushed", stage=stage, gateway=url)
+    except Exception as e:  # noqa: BLE001 — métricas nunca devem derrubar o pipeline
+        log.warning("metrics_push_failed", stage=stage, error=str(e))

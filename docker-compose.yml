@@ -1,30 +1,58 @@
-version: "3.8"
+# =============================================================================
+# Stack do projeto PRF — Engenharia de Dados
+# Sobe: Postgres (DW) + Postgres (Airflow) + RabbitMQ + Pushgateway +
+#       Prometheus + Grafana + Airflow 3.0 (standalone)
+# =============================================================================
 
 x-airflow-common: &airflow-common
-  image: apache/airflow:3.0.6
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: prf-airflow:local
   environment:
+    # ── Metadados do Airflow ──────────────────────────────────────────────
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
     AIRFLOW__CORE__FERNET_KEY: ""
-    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+    # SimpleAuthManager: libera a UI sem login (ambiente de dev/demo local)
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
     PYTHONPATH: /opt/airflow
+    # ── Conexões que o CÓDIGO do pipeline usa (db.py, ingest.py, metrics.py) ─
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: "5432"
+    POSTGRES_DB: prf_dw
+    POSTGRES_USER: prf
+    POSTGRES_PASSWORD: prf123
+    POSTGRES_REPLICA_HOST: postgres-replica
+    POSTGRES_REPLICA_PORT: "5432"
+    RABBITMQ_HOST: rabbitmq
+    RABBITMQ_PORT: "5672"
+    RABBITMQ_USER: prf
+    RABBITMQ_PASSWORD: prf123
+    RABBITMQ_QUEUE: prf_raw_data
+    PUSHGATEWAY_URL: pushgateway:9091
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
   volumes:
     - ./dags:/opt/airflow/dags
     - ./pipeline:/opt/airflow/pipeline
+    - ./scripts:/opt/airflow/scripts
     - ./data:/opt/airflow/data
     - ./logs:/opt/airflow/logs
     - ./monitoring:/opt/airflow/monitoring
     - airflow-plugins:/opt/airflow/plugins
   depends_on:
+    postgres:
+      condition: service_healthy
     postgres-airflow:
       condition: service_healthy
     rabbitmq:
       condition: service_healthy
 
 services:
-  # ── Banco de dados principal (dados PRF) ──────────────────────────────────
+  # ── Banco de dados principal / PRIMÁRIO (Data Warehouse PRF) ──────────────
   postgres:
     image: postgres:15
     container_name: prf-postgres
@@ -32,17 +60,67 @@ services:
       POSTGRES_USER: prf
       POSTGRES_PASSWORD: prf123
       POSTGRES_DB: prf_dw
+    # Habilita streaming replication para a read replica (rubrica A#4).
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "hot_standby=on"
     ports:
-      - "5432:5432"
+      # Porta do host configurável — 5432 pode já estar em uso por outro projeto.
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/00_init_db.sql
+      - ./scripts/01_replication.sh:/docker-entrypoint-initdb.d/01_replication.sh
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "prf"]
+      test: ["CMD", "pg_isready", "-U", "prf", "-d", "prf_dw"]
       interval: 10s
       retries: 5
 
-  # ── Banco de dados do Airflow ─────────────────────────────────────────────
+  # ── Read replica (streaming) do Postgres — distribui leituras (rubrica A#4) ─
+  postgres-replica:
+    image: postgres:15
+    container_name: prf-postgres-replica
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGDATA: /var/lib/postgresql/data
+    # Na 1ª subida, clona o primário via pg_basebackup (-R grava standby.signal
+    # e primary_conninfo); depois sobe como standby read-only e faz streaming.
+    command:
+      - "bash"
+      - "-c"
+      - |
+        set -e
+        chown -R postgres:postgres "$${PGDATA}" || true
+        if [ ! -s "$${PGDATA}/PG_VERSION" ]; then
+          rm -rf "$${PGDATA}"/*
+          echo "[replica] aguardando primário..."
+          until pg_isready -h postgres -p 5432 -U prf; do sleep 2; done
+          echo "[replica] clonando primário via pg_basebackup..."
+          gosu postgres pg_basebackup -h postgres -p 5432 -U replicator \
+            -D "$${PGDATA}" -Fp -Xs -P -R
+        fi
+        chmod 0750 "$${PGDATA}"
+        exec gosu postgres postgres
+    ports:
+      - "${POSTGRES_REPLICA_HOST_PORT:-5434}:5432"
+    volumes:
+      - postgres-replica-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U prf -d prf_dw"]
+      interval: 10s
+      retries: 10
+      start_period: 40s
+
+  # ── Banco de dados de metadados do Airflow ────────────────────────────────
   postgres-airflow:
     image: postgres:15
     container_name: prf-postgres-airflow
@@ -74,7 +152,14 @@ services:
       interval: 15s
       retries: 5
 
-  # ── Prometheus (métricas) ─────────────────────────────────────────────────
+  # ── Pushgateway (recebe métricas dos jobs batch do pipeline) ──────────────
+  pushgateway:
+    image: prom/pushgateway:latest
+    container_name: prf-pushgateway
+    ports:
+      - "9091:9091"
+
+  # ── Prometheus (coleta métricas) ──────────────────────────────────────────
   prometheus:
     image: prom/prometheus:latest
     container_name: prf-prometheus
@@ -82,16 +167,32 @@ services:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
       - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # permite raspar métricas do host (Linux)
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
+    depends_on:
+      - pushgateway
 
-  # ── Grafana (dashboards de métricas) ─────────────────────────────────────
+  # ── Jaeger (tracing distribuído — rubrica A#1) ────────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: prf-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # UI web
+      - "4317:4317"     # OTLP gRPC (receptor de spans)
+      - "4318:4318"     # OTLP HTTP
+
+  # ── Grafana (dashboards) ──────────────────────────────────────────────────
   grafana:
     image: grafana/grafana:latest
     container_name: prf-grafana
     environment:
       GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
     ports:
       - "3000:3000"
     volumes:
@@ -100,44 +201,48 @@ services:
     depends_on:
       - prometheus
 
-  # ── Airflow Webserver ─────────────────────────────────────────────────────
-  airflow-webserver:
+  # ── Airflow 3.0 (standalone: api-server + scheduler + dag-processor) ───────
+  airflow:
     <<: *airflow-common
-    container_name: prf-airflow-webserver
-    command: webserver
+    container_name: prf-airflow
+    command: standalone
     ports:
       - "8080:8080"
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/ >/dev/null || exit 1"]
       interval: 30s
-      retries: 5
+      timeout: 10s
+      retries: 10
+      start_period: 90s
 
-  # ── Airflow Scheduler ─────────────────────────────────────────────────────
-  airflow-scheduler:
-    <<: *airflow-common
-    container_name: prf-airflow-scheduler
-    command: scheduler
-
-  # ── Airflow Init (cria usuário admin) ─────────────────────────────────────
-  airflow-init:
-    <<: *airflow-common
-    container_name: prf-airflow-init
-    entrypoint: /bin/bash
-    command:
-      - -c
-      - |
-        airflow db migrate &&
-        airflow users create \
-          --username admin \
-          --password admin \
-          --firstname Admin \
-          --lastname User \
-          --role Admin \
-          --email admin@prf.gov.br
-    restart: "no"
+  # ── API de consumo (FastAPI, cursor pagination, lê da réplica) ── rubrica A#5
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    image: prf-api:local
+    container_name: prf-api
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: prf_dw
+      POSTGRES_USER: prf
+      POSTGRES_PASSWORD: prf123
+      POSTGRES_REPLICA_HOST: postgres-replica
+      POSTGRES_REPLICA_PORT: "5432"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    volumes:
+      - ./api:/app/api
+      - ./pipeline:/app/pipeline
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres-replica:
+        condition: service_healthy
 
 volumes:
   postgres-data:
+  postgres-replica-data:
   postgres-airflow-data:
   rabbitmq-data:
   grafana-data:

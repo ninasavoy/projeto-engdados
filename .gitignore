@@ -147,6 +147,13 @@ activemq-data/
 # SageMath parsed files
 *.sage.py
 
+# Dados do pipeline. O BRONZE (datatran real da PRF) É versionado para
+# reprodutibilidade; silver/gold são gerados e não entram no git.
+data/silver/
+data/gold/
+data/sample/
+logs/
+
 # Environments
 .env
 .envrc

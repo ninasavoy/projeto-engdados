@@ -23,7 +23,9 @@ from pipeline.metrics import (
     records_processed,
     stage_duration_seconds,
     last_run_timestamp,
+    push_metrics,
 )
+from pipeline.tracing import init_tracing, extract_context, shutdown_tracing
 
 load_dotenv()
 log = get_logger("transform")
@@ -151,31 +153,38 @@ def run_transform(max_messages: int = 0) -> None:
     messages_consumed = 0
     all_dfs = []
     t0 = time.time()
+    tracer = init_tracing("prf-transform")
 
     log.info("transform_started", queue=queue)
 
     while True:
-        method_frame, _, body = channel.basic_get(queue=queue, auto_ack=False)
+        method_frame, properties, body = channel.basic_get(queue=queue, auto_ack=False)
         if method_frame is None:
             log.info("queue_empty", consumed=messages_consumed)
             break
 
-        try:
-            raw = json.loads(body.decode("utf-8"))
-            df = pd.DataFrame(raw)
-            df_clean = clean_dataframe(df)
-            inserted = insert_silver(df_clean)
-            all_dfs.append(df_clean)
+        # Continua a MESMA trace iniciada na ingestão (contexto vindo nos headers).
+        headers = getattr(properties, "headers", None)
+        ctx = extract_context(headers)
 
-            records_processed.inc(inserted)
-            total_processed += inserted
-            messages_consumed += 1
-            channel.basic_ack(delivery_tag=method_frame.delivery_tag)
+        with tracer.start_as_current_span("transform.process_batch", context=ctx) as span:
+            try:
+                raw = json.loads(body.decode("utf-8"))
+                df = pd.DataFrame(raw)
+                df_clean = clean_dataframe(df)
+                inserted = insert_silver(df_clean)
+                all_dfs.append(df_clean)
 
-        except Exception as e:
-            pipeline_errors.labels(stage="transform", error_type=type(e).__name__).inc()
-            log.error("transform_batch_error", error=str(e))
-            channel.basic_nack(delivery_tag=method_frame.delivery_tag, requeue=False)
+                span.set_attribute("prf.records_inserted", inserted)
+                records_processed.inc(inserted)
+                total_processed += inserted
+                messages_consumed += 1
+                channel.basic_ack(delivery_tag=method_frame.delivery_tag)
+
+            except Exception as e:
+                pipeline_errors.labels(stage="transform", error_type=type(e).__name__).inc()
+                log.error("transform_batch_error", error=str(e))
+                channel.basic_nack(delivery_tag=method_frame.delivery_tag, requeue=False)
 
         if max_messages and messages_consumed >= max_messages:
             break
@@ -192,6 +201,8 @@ def run_transform(max_messages: int = 0) -> None:
     elapsed = time.time() - t0
     stage_duration_seconds.labels(stage="transform").observe(elapsed)
     last_run_timestamp.labels(stage="transform").set_to_current_time()
+    push_metrics("transform")
+    shutdown_tracing()
 
     log.info(
         "transform_finished",

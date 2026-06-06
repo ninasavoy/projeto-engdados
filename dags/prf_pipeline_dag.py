@@ -34,16 +34,12 @@ def task_ingest(**context):
     sys.path.insert(0, "/opt/airflow")
 
     from pipeline.ingestion.ingest import run_ingestion
-    from pipeline.metrics import start_metrics_server
 
-    # Expõe métricas apenas se não estiver rodando em subprocesso já ativo
-    try:
-        start_metrics_server()
-    except Exception:
-        pass
-
+    # Métricas vão para o Pushgateway ao fim de cada etapa (ver metrics.py),
+    # então não é preciso subir um servidor HTTP efêmero aqui.
     years = context["params"].get("years", None)
-    run_ingestion(years=years)
+    max_records = context["params"].get("max_records", 0) or None
+    run_ingestion(years=years, max_records=max_records)
 
 
 def task_transform(**context):
@@ -138,6 +134,7 @@ with DAG(
     tags=["prf", "engenharia-dados", "transporte"],
     params={
         "years": ["2021", "2022", "2023"],
+        "max_records": 0,   # 0 = sem limite; >0 limita registros/arquivo (demo rápida)
     },
     on_failure_callback=task_notify_failure,
 ) as dag:

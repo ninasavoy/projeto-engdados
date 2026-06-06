@@ -1,0 +1,15 @@
+# Dependências da API de consumo (serviço separado dos demais).
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+sqlalchemy>=1.4.49,<2.0
+psycopg2-binary>=2.9.9     # dialeto SQLAlchemy postgresql+psycopg2
+psycopg[binary]>=3.2.4    # importado por pipeline.db (conexões diretas)
+python-dotenv>=1.0.0
+structlog>=24.1.0
+
+# OpenTelemetry — a API entra na mesma malha de tracing (Jaeger).
+opentelemetry-sdk==1.27.0
+opentelemetry-exporter-otlp==1.27.0
+opentelemetry-instrumentation-fastapi==0.48b0
+opentelemetry-instrumentation-sqlalchemy==0.48b0
+opentelemetry-instrumentation-requests==0.48b0
