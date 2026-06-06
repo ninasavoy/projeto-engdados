@@ -163,6 +163,9 @@ projeto-engdados/
 
 ---
 
-## Vídeo de Apresentação
+## Link para o relatório
+https://docs.google.com/document/d/1tT1tQhbtSZTcALWDtIuypJrInjyKfR9jwtB6dCyjL-Q/edit?usp=sharing
+
+## Link para o vídeo
 
 📹 [Assista no YouTube](https://youtu.be/FPtOIU9iUOk)
